@@ -265,6 +265,48 @@ it by entering a wrong password and checking that no TOTP prompt appears; do
 not enable `otp_enroll=true` until that holds, or someone without the password
 could enroll their own key. Do not add the module as `sufficient`.
 
+#### RHEL-family systems (RHEL, Rocky, Alma, Oracle Linux)
+
+The stock `/etc/pam.d/sshd` there starts with `auth substack password-auth`.
+A substack does not stop the outer stack when the password is wrong, so a
+module placed after it would still run and could show an enrollment QR code to
+someone without the password. Replace that one line with the local password
+check run directly, as `requisite`:
+
+```text
+auth       required     pam_env.so
+auth       required     pam_faildelay.so delay=2000000
+auth       requisite    pam_unix.so
+auth       required     pam_totp.so otp_enroll=true
+auth       include      postlogin
+```
+
+This covers local accounts. If the host authenticates against a directory
+(sssd), keep that module in the list as well.
+
+The module goes in `/usr/lib64/security/`, and the service is `sshd`. With
+SELinux enforcing, label the working directory so sshd may write its state:
+
+```sh
+sudo semanage fcontext -a -t var_auth_t '/etc/pam_totp(/.*)?'
+sudo restorecon -R /etc/pam_totp /usr/lib64/security/pam_totp.so
+```
+
+This layout was checked with real logins on Rocky Linux 9 and on Oracle
+Linux 10 with SELinux enforcing.
+
+#### Exempting root
+
+To let root skip the TOTP step, put this line directly before the module:
+
+```text
+auth [success=1 default=ignore] pam_succeed_if.so uid eq 0 quiet
+```
+
+Only do this where root cannot log in with a password
+(`PermitRootLogin prohibit-password`), otherwise root is protected by the
+password alone.
+
 ### 5. Configure sshd
 
 In `/etc/ssh/sshd_config` (or a file in `/etc/ssh/sshd_config.d/`):
@@ -353,8 +395,8 @@ journalctl | grep pam_totp
   delete `/etc/pam_totp/THROTTLE`.
 - To re-enroll a user, delete their `KEY`.
 - To back out, remove the `pam_totp.so` line from `/etc/pam.d/sshd`.
-- On SELinux systems, sshd may be denied access to the working directory; look
-  for denials in the audit log.
+- On SELinux systems, label the working directory `var_auth_t` (see the
+  RHEL-family notes in step 4); without it sshd is denied access.
 
 ## Limits
 
