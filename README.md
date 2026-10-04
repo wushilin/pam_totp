@@ -310,21 +310,23 @@ created by the module. It holds at most 4096 fixed-size records (about
 record keeps the total failure count, the consecutive failure count and the
 last three failure times.
 
-Two counters apply to every wrong code:
-
-| Counter | Free failures | Penalty | Cap |
-|---|---|---|---|
-| Per user and source address | 2 | 5 s from the third, doubling each time | 1 hour |
-| Per user, from any address | 9 | 5 s from the tenth, doubling each time | 5 minutes |
+Failures are counted per user and source address. The first two consecutive
+wrong codes carry no penalty. From the third, further attempts for that user
+from that address are refused for 5 seconds, doubling with each additional
+wrong code (10 s, 20 s, 40 s, ...) up to one hour at the thirteenth.
 
 The source address is `PAM_RHOST`. IPv6 addresses are grouped by their /64
-prefix, since a client can change address freely inside it. The per-user
-counter holds back an attacker spread over many addresses; its short cap means
-the real user is never shut out for more than five minutes at a time.
+prefix, since a client can change address freely inside it.
+
+There is deliberately no counter per user across all addresses, so nobody can
+keep a legitimate user out by failing on their behalf from somewhere else.
+The cost is that an attacker who knows the password and controls many
+addresses gets two free guesses from each; use a firewall or fail2ban if that
+matters on your host.
 
 Attempts made during a penalty are rejected without being checked and are not
 counted. A reused code is refused but not counted either. A successful login
-resets both consecutive counts, as does a gap of more than 24 hours since the
+resets the consecutive count, as does a gap of more than 24 hours since the
 last failure. Deleting `THROTTLE` clears all penalties.
 
 ## Logging

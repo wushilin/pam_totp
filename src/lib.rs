@@ -30,17 +30,12 @@ struct Limits {
     max_secs: u64,
 }
 
-// Failures from one source against one user.
+// Failures from one source against one user. There is deliberately no
+// counter per user across all sources: it would let an attacker keep the
+// real user out.
 const HOST_LIMITS: Limits = Limits {
     threshold: 3,
     max_secs: 3600,
-};
-// Failures against one user from anywhere. It is slower to trigger and has a
-// short cap so an attacker spread over many addresses is still held back
-// without locking the real user out for long.
-const USER_LIMITS: Limits = Limits {
-    threshold: 10,
-    max_secs: 300,
 };
 
 struct Config {
@@ -770,12 +765,6 @@ fn throttle_key(user: &str, rhost: &[u8]) -> [u8; 20] {
     <Sha1 as sha1::Digest>::digest(&data).into()
 }
 
-fn user_throttle_key(user: &str) -> [u8; 20] {
-    let mut data = vec![b'U'];
-    data.extend_from_slice(user.as_bytes());
-    <Sha1 as sha1::Digest>::digest(&data).into()
-}
-
 fn throttle_penalty(limits: &Limits, consecutive: u32) -> u64 {
     if consecutive < limits.threshold {
         return 0;
@@ -871,11 +860,9 @@ fn store_throttle(f: &File, entries: &[ThrottleEntry], idx: usize) -> Result<(),
     .map_err(|_| ())
 }
 
-fn throttled(base: &Path, host_key: &[u8; 20], user_key: &[u8; 20]) -> Result<bool, ()> {
+fn throttled(base: &Path, host_key: &[u8; 20]) -> Result<bool, ()> {
     let (_f, entries) = open_throttle(base)?;
-    let now = now_secs()?;
-    Ok(throttle_blocked(&HOST_LIMITS, &entries, host_key, now)
-        || throttle_blocked(&USER_LIMITS, &entries, user_key, now))
+    Ok(throttle_blocked(&HOST_LIMITS, &entries, host_key, now_secs()?))
 }
 
 fn remote_host(pamh: *mut libc::c_void) -> Vec<u8> {
@@ -909,8 +896,7 @@ fn verify_or_enroll(
         printable(&rhost)
     );
     let host_key = throttle_key(user, &rhost);
-    let user_key = user_throttle_key(user);
-    if throttled(base, &host_key, &user_key)? {
+    if throttled(base, &host_key)? {
         log(&format!("throttled {who}"));
         let _ = show_text(pamh, "Too many failed TOTP attempts. Try again later.");
         return Err(());
@@ -938,7 +924,7 @@ fn verify_or_enroll(
     // No lock is held while the user types; everything below is short file I/O.
     let _lock = lock_user_dir(dir)?;
     // Re-check under the user lock so parallel logins cannot each spend a guess.
-    if throttled(base, &host_key, &user_key)? {
+    if throttled(base, &host_key)? {
         log(&format!("throttled {who}"));
         return Err(());
     }
@@ -950,10 +936,8 @@ fn verify_or_enroll(
             // The code is already consumed, so a throttle error here must not
             // fail the login.
             if let Ok((f, mut entries)) = open_throttle(base) {
-                for k in [&host_key, &user_key] {
-                    if let Some(idx) = throttle_clear(&mut entries, k) {
-                        let _ = store_throttle(&f, &entries, idx);
-                    }
+                if let Some(idx) = throttle_clear(&mut entries, &host_key) {
+                    let _ = store_throttle(&f, &entries, idx);
                 }
             }
             Ok(())
@@ -961,11 +945,8 @@ fn verify_or_enroll(
         Err(Failure::BadCode) => {
             log(&format!("wrong code for {who}"));
             let (f, mut entries) = open_throttle(base)?;
-            let now = now_secs()?;
-            for k in [&host_key, &user_key] {
-                let idx = throttle_fail(&mut entries, k, now);
-                store_throttle(&f, &entries, idx)?;
-            }
+            let idx = throttle_fail(&mut entries, &host_key, now_secs()?);
+            store_throttle(&f, &entries, idx)?;
             Err(())
         }
         Err(Failure::Replay) => {
@@ -1115,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn throttle_groups_ipv6_by_prefix_and_limits_per_user() {
+    fn throttle_groups_ipv6_by_prefix_and_is_per_source() {
         let a = throttle_key("alice", b"2001:db8:1:2::1");
         assert_eq!(a, throttle_key("alice", b"2001:db8:1:2:ffff::9"));
         assert_ne!(a, throttle_key("alice", b"2001:db8:1:3::1"));
@@ -1123,11 +1104,14 @@ mod tests {
             throttle_key("alice", b"::ffff:10.0.0.1"),
             throttle_key("alice", b"10.0.0.1")
         );
-        assert_ne!(throttle_key("alice", b""), user_throttle_key("alice"));
-
-        assert_eq!(throttle_penalty(&USER_LIMITS, 9), 0);
-        assert_eq!(throttle_penalty(&USER_LIMITS, 10), 5);
-        assert_eq!(throttle_penalty(&USER_LIMITS, 40), 300);
+        // One source being throttled leaves the same user free elsewhere.
+        let mut entries = Vec::new();
+        for i in 0..20 {
+            throttle_fail(&mut entries, &a, 1000 + i);
+        }
+        assert!(throttle_blocked(&HOST_LIMITS, &entries, &a, 1100));
+        let elsewhere = throttle_key("alice", b"10.0.0.1");
+        assert!(!throttle_blocked(&HOST_LIMITS, &entries, &elsewhere, 1100));
     }
 
     #[test]
