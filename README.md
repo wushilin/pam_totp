@@ -1,81 +1,188 @@
 # pam-totp-rs
 
 A Rust Linux-PAM authentication module that verifies a TOTP after an earlier PAM
-module has checked the user's password. It supports a group exemption and
-per-user replay state.
+module has checked the user's password. It supports self-enrollment at first
+login, a group exemption, an SSH public-key exemption, per-user replay state
+and failure throttling.
 
-## Configuration
+## How a login flows
 
-Pass these options on the `auth` line in `/etc/pam.d/<service>`:
-
-```text
-auth required pam_totp.so otp_required=true otp_exempted_group=wheel publickey_exempted=true pam_working_dir=/etc/pam_totp
+```mermaid
+flowchart TD
+    start([PAM auth stack runs]) --> pw{Password correct?}
+    pw -- no --> deny1([Denied. The module never runs])
+    pw -- yes --> req{otp_required=false?}
+    req -- yes --> ok1([Allowed without a code])
+    req -- no --> pk{publickey_exempted=true and<br/>sshd reports an earlier public-key step?}
+    pk -- yes --> ok1
+    pk -- no --> grp{User in otp_exempted_group?}
+    grp -- yes --> ok1
+    grp -- no --> dir{User directory exists?}
+    dir -- "no, otp_enroll=true and real account" --> mk[Create the directory]
+    dir -- "no, otherwise" --> deny2([Denied])
+    mk --> thr
+    dir -- yes --> thr{Throttled?}
+    thr -- yes --> deny3([Denied with a 'too many attempts' message])
+    thr -- no --> key{KEY exists?}
+    key -- "no, otp_enroll=false" --> deny2
+    key -- "no, otp_enroll=true" --> qr[Show QR code and manual key]
+    qr --> ask[Ask for 'TOTP code:']
+    key -- yes --> ask
+    ask --> chk{Code}
+    chk -- "correct and not used before" --> ok2([Allowed. LAST_STEP saved, counters reset,<br/>KEY saved if enrolling])
+    chk -- "correct but already used" --> deny4([Denied, not counted as a failure])
+    chk -- wrong --> deny5([Denied, failure counted])
 ```
 
-`otp_required=false` skips the OTP check for all users. When it is true, members
-of `otp_exempted_group` pass this module without an OTP. Every other user must
-have a valid key and a valid, not previously accepted TOTP. Missing or unsafe
-files and malformed state fail closed. Add `otp_enroll=true` to enroll users
-without a key at their first successful password login:
+## Self-enrollment
 
-```text
-auth required pam_totp.so otp_required=true otp_exempted_group=wheel otp_enroll=true pam_working_dir=/etc/pam_totp
-```
+With `otp_enroll=true`, a user who has no key yet sets one up during their
+first password login. Nothing has to be prepared per user.
 
-The module displays an ASCII QR code and a manual-entry secret in the terminal.
-The user must enter a currently valid TOTP before the key is written. If the
-code is wrong or the login is interrupted, no key is saved and enrollment can
-be retried. Exempt users skip enrollment. Enrollment is disabled by default.
-With `publickey_exempted=true`, the module skips its OTP step when an earlier
-public-key step is reported by OpenSSH in `SSH_AUTH_INFO_0`. This is an
-OpenSSH-specific signal. A public-key-only SSH authentication path normally
-does not invoke PAM's `auth` stack at all, so the SSH method policy must also
-allow public-key authentication as its own alternative if key-only logins
-should skip OTP.
-
-For the two-path SSH policy (key-only, or password plus OTP), OpenSSH can use:
-
-```text
-PubkeyAuthentication yes
-PasswordAuthentication no
-KbdInteractiveAuthentication yes
-AuthenticationMethods publickey keyboard-interactive:pam
-```
-
-Whitespace separates alternatives here: a user can authenticate with a key,
-or use keyboard-interactive PAM, which runs the configured password and OTP
-checks. If `publickey_exempted=false`, the module itself never skips OTP when
-PAM auth runs; to require OTP on key logins too, sshd must require a
-`keyboard-interactive:pam` step after the public key. With the example PAM
-stack, that path also asks for the Unix password.
-
-## Local test utility
-
-Build `otputil` on the machine from which you test SSH:
+What the administrator does once:
 
 ```sh
-cargo build --release --bin otputil
-target/release/otputil --key BASE32_KEY
+sudo install -d -o root -g root -m 0700 /etc/pam_totp
 ```
 
-It prints codes for the current 30-second time step and the next two. Use
-`--key-stdin` to avoid putting a key in process arguments, or `--key-file PATH`
-to read one from a protected file. `--time UNIX_SECONDS` selects a fixed time
-for repeatable tests. `otputil` is a test helper and is not installed with the
-PAM module.
+and adds `otp_enroll=true` to the module line (see the setup guide below).
 
-Create root-owned per-user directories and files, for example:
+What happens at the user's first login:
+
+1. The user enters their password as usual.
+2. The module creates `/etc/pam_totp/<user>` (mode `0700`), generates a random
+   160-bit secret and prints a QR code plus the same secret as text.
+3. The user scans the QR code with an authenticator app (or types the key in)
+   and enters the six-digit code the app shows.
+4. Only if that code is correct is the secret saved as `KEY` and the login
+   allowed. A wrong code or a dropped connection saves nothing; the next login
+   starts again with a new secret.
+
+From then on the user is asked for `TOTP code:` after the password.
+
+This is a capture of a real first login (test user in a throwaway container;
+typed input is not echoed):
 
 ```text
-/etc/pam_totp/jack/KEY
-/etc/pam_totp/jack/LAST_STEP   # created and updated by the module
-/etc/pam_totp/jack/LOCK        # created and retained by the module
+$ ssh jack@host
+(jack@host) Password:
+First-time TOTP setup for jack. Scan this QR code with your authenticator, then enter the displayed six-digit code to finish enrollment.
+
+█████████████████████████████████████████████████
+█████████████████████████████████████████████████
+████ ▄▄▄▄▄ █▀██████ ▄▄█▄▀▄▄▄▄▀▄▀▀█ ▄▀█ ▄▄▄▄▄ ████
+████ █   █ █▀ ▄▄ █▄ ▄▀▀▄ ▄▄▄▄█ █▀▀█▀▄█ █   █ ████
+████ █▄▄▄█ █▀▀▄▀▄▄ ▄▄▀▀▄█▄ ▄▀ ▀  ▄▄▄▄█ █▄▄▄█ ████
+████▄▄▄▄▄▄▄█▄▀ ▀▄█▄█ █▄█ ▀ █▄█ ▀ █▄▀ █▄▄▄▄▄▄▄████
+████  ▄▄▄▀▄ ▄▄▀▀ ▀ ▀ █▀█▀█▀▀▀  █▀ █▀▀▄▀ ▀▄█▄▀████
+██████▀▄▀ ▄ ▄█  ▀ ▄ ▀▄▄▀█  ▀▀██▄▄█▀█▄▄█ █▀███████
+████▄█  ▄ ▄▄█ ▀█▀▀▄ ▄▄▄▀▀▀▀▀██▄▄▄▄▀▀█▀▀▀▀█▄▄ ████
+████ ▀▄▄█▄▄▀▄█▄█▀▄█ ▄█▀▀ ▀▀█▀▄▀  █▀██▀██  ▄▀█████
+████▄▄█ █▀▄ ▀▀▀█▄█▄ ▀██▄  ▄▄▄▄▄█▀▄▀▀▀▀▀█▀▄▄▀▀████
+████ ▀ ▄█▀▄   █▀ █▀ ▀█ ▀▄▀▄███▀ ▄▄████▄ █ █▀▀████
+████ █ █▄ ▄ ▀█▀█▄█▀ ▀█ ▀▀██ ▄▄▀▄▀ ▀▀  ▀ ▀▄▄█▀████
+█████▄▄▀▄█▄ ▄▄▄ ▄▄▀█▀█▄█▄ ▀▀██  █▄██▀█  ▄ ▄█▀████
+████ ▄██▄▀▄███▀ ▀▀▄█▄ ▄ ▄  ▀▀▄▄█▀ █▀ █▀█▀ ▄▀ ████
+█████ ▄█ ▄▄██▀▄█  ▄ ▀ ▀█▄▀▄█▄█▀▄█▄█▀ █▄██ █ ▀████
+████ ▀██▀▄▄▄ █ █▀▀▄ ▄█▀ ▀▀ ▀▄▄██▀▄█  █▀▄▀ ▄ ▀████
+████ █  ▄█▄▄▄███▀▄█ ▄▄▄▀█▀ █▀▄▀ ▀█▀▀ ▀██▀ █▀▀████
+████▄█▄███▄█▀▄ ███▄  ▄▄█    █▄ ▄▀▄█▄ ▄▄▄ ▀▄█▀████
+████ ▄▄▄▄▄ █▄█ ▀▄█▀▄▄█▄▀  ███▄▄▄█▄ ▄ █▄█ ▀█▄█████
+████ █   █ █ ▀▄█▄█▀ ▀█▄▀ ▀▄▀▄▄▄█ ▄▀█▄▄▄ ▄▀▄█ ████
+████ █▄▄▄█ █ ▄█ ▄█▄█▀▄▄█ ▀▀█▄▄█ ▄█ █▀█▄█  █▀█████
+████▄▄▄▄▄▄▄█▄█▄▄█▄███████▄▄█▄▄▄█▄▄▄▄█▄███▄▄██████
+█████████████████████████████████████████████████
+█████████████████████████████████████████████████
+
+If scanning does not work, add this key manually (SHA1, 6 digits, 30-second period):
+C373IWSGY3RG3DQ33CT4DTLZCJD6P2M2
+(jack@host) TOTP code:
+LOGIN-OK
 ```
 
-The working directory and its user directories must be owned by root and not
-writable by group or others. `KEY` must be root-owned with mode `0600`; it
-contains the Base32 TOTP secret. The module accepts six-digit SHA-1 TOTP values
-with a 30-second period and a one-step clock-skew window on either side.
+and the files it leaves behind:
+
+```text
+/etc/pam_totp:
+-rw------- 1 root root  0 THROTTLE
+drwx------ 2 root root  5 jack
+
+/etc/pam_totp/jack:
+-rw------- 1 root root 33 KEY
+-rw------- 1 root root  9 LAST_STEP
+-rw------- 1 root root  0 LOCK
+```
+
+Things to know before turning it on:
+
+- Enrollment is trust-on-first-use. Whoever first presents the correct
+  password for an account without a key enrolls their own device. That
+  includes root and service accounts that have passwords. Enroll important
+  accounts yourself, or exempt them, before exposing the host.
+- The directory is created only for names that exist in the account database,
+  and under the database's own spelling of the name, so `JACK` and `jack` on a
+  case-insensitive directory service are one enrollment.
+- The QR code and key stay in the terminal's scrollback and in any session
+  recording. Clear the screen after enrolling.
+- The QR code needs a UTF-8 terminal. It is drawn for dark-background
+  terminals; set `qr_dark_terminal=false` if your users have light ones. The
+  text key always works.
+- To make a user enroll again, delete their `KEY` file.
+
+## What each path looks like
+
+All captured from real SSH logins (`ssh ... echo LOGIN-OK`).
+
+Wrong password. The module never runs, so there is no TOTP prompt and no
+enrollment:
+
+```text
+(jack@host) Password:
+jack@host: Permission denied (publickey,keyboard-interactive).
+```
+
+Normal login for an enrolled user:
+
+```text
+(jack@host) Password:
+(jack@host) TOTP code:
+LOGIN-OK
+```
+
+Wrong code, or a code that was already used:
+
+```text
+(jack@host) Password:
+(jack@host) TOTP code:
+jack@host: Permission denied (publickey,keyboard-interactive).
+```
+
+After three wrong codes in a row, attempts are refused before the prompt:
+
+```text
+(jack@host) Password:
+Too many failed TOTP attempts. Try again later.
+jack@host: Permission denied (publickey,keyboard-interactive).
+```
+
+Member of `otp_exempted_group`, or public key followed by password with
+`publickey_exempted=true`:
+
+```text
+(opsadmin@host) Password:
+LOGIN-OK
+```
+
+What the administrator sees in the system log for the above:
+
+```text
+pam_totp: enrolled a new key for user jack from 127.0.0.1
+pam_totp: already used code for user jack from 127.0.0.1
+pam_totp: wrong code for user jack from 127.0.0.1
+pam_totp: wrong code for user jack from 127.0.0.1
+pam_totp: wrong code for user jack from 127.0.0.1
+pam_totp: throttled user jack from 127.0.0.1
+```
 
 ## Setup guide (SSH)
 
@@ -90,6 +197,7 @@ time; a mistake in PAM or sshd configuration can lock you out.
 | `otp_exempted_group=NAME` | none | Members of this group skip the OTP step. |
 | `publickey_exempted=true\|false` | `false` | Skip the OTP step when sshd reports an earlier public-key step. |
 | `otp_enroll=true\|false` | `false` | Let a user without a `KEY` enroll at login. |
+| `qr_dark_terminal=true\|false` | `true` | Draw the enrollment QR code for dark-background terminals. |
 | `pam_working_dir=/abs/path` | `/etc/pam_totp` | Where keys and state are stored. |
 
 An unknown option or a bad value makes the module fail every login, so check
@@ -108,32 +216,33 @@ sudo install -o root -g root -m 0755 pam_totp-x86_64-linux-gnu.so \
 The directory is the one that already contains `pam_unix.so`. On RHEL-family
 systems it is `/usr/lib64/security`.
 
-### 2. Create the working directory and a user directory
+### 2. Create the working directory
 
 ```sh
 sudo install -d -o root -g root -m 0700 /etc/pam_totp
+```
+
+The module never creates this directory. With `otp_enroll=true` that is all
+the preparation needed. Without it, also create a directory for each user you
+give a key to by hand:
+
+```sh
 sudo install -d -o root -g root -m 0700 /etc/pam_totp/jack
 ```
 
-The working directory is never created by the module. The per-user directory
-is created automatically only when `otp_enroll=true` and the login name is an
-existing account; otherwise a user without a directory is rejected, so create
-one for each user you give a key to by hand.
+### 3. Give users a key
 
-### 3. Give the user a key
+With `otp_enroll=true`, skip this step; see Self-enrollment above.
 
-Either create the key yourself:
+To create a key yourself:
 
 ```sh
 sudo sh -c 'umask 077; head -c 20 /dev/urandom | base32 > /etc/pam_totp/jack/KEY'
 sudo cat /etc/pam_totp/jack/KEY
 ```
 
-and type the printed key into an authenticator app (time-based, SHA-1,
-6 digits, 30 seconds), or skip this step and set `otp_enroll=true` so the user
-is shown a QR code at their first password login.
-
-Check the key before touching PAM:
+Type the printed key into an authenticator app (time-based, SHA-1, 6 digits,
+30 seconds), then check it before touching PAM:
 
 ```sh
 sudo cat /etc/pam_totp/jack/KEY | otputil --key-stdin
@@ -147,29 +256,38 @@ In `/etc/pam.d/sshd`, add the module directly after the password check:
 
 ```text
 @include common-auth
-auth required pam_totp.so
+auth required pam_totp.so otp_enroll=true
 ```
 
 A wrong password must end authentication before this line is reached. The
 stock Debian/Ubuntu `common-auth` does that. On other distributions, confirm
 it by entering a wrong password and checking that no TOTP prompt appears; do
 not enable `otp_enroll=true` until that holds, or someone without the password
-could enroll their own key.
+could enroll their own key. Do not add the module as `sufficient`.
 
 ### 5. Configure sshd
 
-In `/etc/ssh/sshd_config`:
+In `/etc/ssh/sshd_config` (or a file in `/etc/ssh/sshd_config.d/`):
 
 ```text
 UsePAM yes
 KbdInteractiveAuthentication yes
 PasswordAuthentication no
+AuthenticationMethods publickey keyboard-interactive:pam
 ```
 
 `PasswordAuthentication` must be off because that method cannot display a
-second prompt; password logins go through keyboard-interactive instead. Add
-the `AuthenticationMethods` line from the Configuration section if key-only
-logins should remain possible. Then validate and reload:
+second prompt; password logins go through keyboard-interactive instead.
+
+The `AuthenticationMethods` line gives two alternatives: a public key alone,
+or keyboard-interactive PAM (password, then OTP). A key-only login does not
+run PAM's `auth` stack at all, so it never reaches this module. To require
+more than a key, list the methods with a comma instead, for example
+`publickey,keyboard-interactive:pam`; the module then asks for the OTP after
+the password unless `publickey_exempted=true`, in which case the key replaces
+the OTP. That exemption relies on OpenSSH's `SSH_AUTH_INFO_0`.
+
+Validate and reload:
 
 ```sh
 sudo sshd -t && sudo systemctl reload ssh
@@ -184,41 +302,81 @@ ssh -o PubkeyAuthentication=no jack@host
 You should be asked for the password and then for `TOTP code:`. Also check
 that a wrong code is refused and that reusing an accepted code is refused.
 
-### Troubleshooting
+## Failure throttling
 
-- Every login fails: check option spelling, then ownership and modes. The
-  working directory, user directory, `KEY`, `LAST_STEP`, `LOCK` and `THROTTLE`
-  must all be owned by root and not accessible to group or others.
-- Correct codes are refused: check the host clock, and see Failure throttling
-  below; deleting `/etc/pam_totp/THROTTLE` clears all penalties.
+Wrong codes are counted in `/etc/pam_totp/THROTTLE`, a root-owned `0600` file
+created by the module. It holds at most 4096 fixed-size records (about
+213 KB); when full, the record with the oldest last failure is replaced. Each
+record keeps the total failure count, the consecutive failure count and the
+last three failure times.
+
+Two counters apply to every wrong code:
+
+| Counter | Free failures | Penalty | Cap |
+|---|---|---|---|
+| Per user and source address | 2 | 5 s from the third, doubling each time | 1 hour |
+| Per user, from any address | 9 | 5 s from the tenth, doubling each time | 5 minutes |
+
+The source address is `PAM_RHOST`. IPv6 addresses are grouped by their /64
+prefix, since a client can change address freely inside it. The per-user
+counter holds back an attacker spread over many addresses; its short cap means
+the real user is never shut out for more than five minutes at a time.
+
+Attempts made during a penalty are rejected without being checked and are not
+counted. A reused code is refused but not counted either. A successful login
+resets both consecutive counts, as does a gap of more than 24 hours since the
+last failure. Deleting `THROTTLE` clears all penalties.
+
+## Logging
+
+The module writes to syslog (`authpriv`, prefixed `pam_totp:`) when it rejects
+a login or enrolls a key: invalid options, missing or unusable directory or
+key, wrong code, reused code, throttled attempt, clock behind. Codes and keys
+are never logged.
+
+```sh
+journalctl | grep pam_totp
+```
+
+## Troubleshooting and recovery
+
+- Every login fails: check the log line above first, then option spelling,
+  then ownership and modes. The working directory, user directory, `KEY`,
+  `LAST_STEP`, `LOCK` and `THROTTLE` must all be owned by root and not
+  accessible to group or others. Symlinks are refused.
+- Correct codes are refused after the clock was corrected backwards: the
+  module only accepts codes newer than the last one it accepted. Delete the
+  user's `LAST_STEP` once the clock is right.
+- Correct codes are refused after failed attempts: wait out the penalty or
+  delete `/etc/pam_totp/THROTTLE`.
 - To re-enroll a user, delete their `KEY`.
 - To back out, remove the `pam_totp.so` line from `/etc/pam.d/sshd`.
 - On SELinux systems, sshd may be denied access to the working directory; look
   for denials in the audit log.
 
-## Failure throttling
+## Limits
 
-Wrong codes are counted per user and remote host (`PAM_RHOST`) in
-`/etc/pam_totp/THROTTLE`, a root-owned `0600` file created by the module. It
-holds at most 4096 fixed-size records (about 213 KB); when full, the record
-with the oldest last failure is replaced. Each record keeps the total failure
-count, the consecutive failure count and the last three failure times.
+- Six-digit SHA-1 TOTP, 30-second period, one step of clock skew either side.
+  The host clock must be synchronized.
+- Login names may contain letters, digits and `_ . - @`. Other names are
+  rejected.
+- A full disk stops codes being recorded as used, so logins fail closed.
+  Keep an exempt administrator or a key-only path for that case.
+- The module does not create accounts or configure sudo.
+- It relies on `flock` and atomic rename in the working directory.
 
-The first two consecutive failures carry no penalty. From the third, the
-module rejects further attempts from that user and host for 5 seconds,
-doubling with each additional failure up to one hour. Attempts made during a
-penalty are rejected without being checked and are not counted. A successful
-login resets the consecutive count, as does a gap of more than 24 hours since
-the last failure. Deleting `THROTTLE` clears all penalties.
+## Local test utility
 
-## PAM ordering
+```sh
+cargo build --release --bin otputil
+target/release/otputil --key BASE32_KEY
+```
 
-Put the module after the password check and make its result required. The
-password check must stop the stack on failure (for a simple stack, use
-`requisite pam_unix.so`); PAM's `required` control records failure but continues
-to later modules, which could otherwise display enrollment after a bad
-password. Do not add the OTP module as `sufficient`. For SSH, enable PAM and
-keyboard-interactive authentication so the OTP prompt can be answered.
+It prints codes for the current 30-second time step and the next two. Use
+`--key-stdin` to avoid putting a key in process arguments, or `--key-file PATH`
+to read one from a protected file. `--time UNIX_SECONDS` selects a fixed time
+for repeatable tests. `otputil` is a test helper and is not installed with the
+PAM module.
 
 ## Build
 
@@ -227,12 +385,8 @@ Build on the target Linux distribution (or with a matching Linux cross toolchain
 ```sh
 cargo build --release
 sudo install -o root -g root -m 0755 target/release/libpam_totp.so \
-  /usr/lib/security/pam_totp.so
+  /usr/lib/x86_64-linux-gnu/security/pam_totp.so
 ```
-
-The correct PAM module directory varies by distribution and architecture.
-Test with a disposable system and keep an independent root session open while
-editing PAM policy.
 
 Building needs the PAM development files (`libpam0g-dev` on Debian/Ubuntu,
 `pam-devel` on RHEL-family systems).
@@ -249,20 +403,27 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 The binaries need glibc 2.35 or newer. Build from source on older systems.
-
-## Stress test
+Each binary carries a build provenance attestation:
 
 ```sh
-cargo test --release -- --ignored --nocapture
+gh attestation verify pam_totp-x86_64-linux-gnu.so --repo wushilin/pam_totp
 ```
 
-This runs several million operations across the TOTP, throttle, PAM
+## Tests
+
+```sh
+cargo test                                      # unit tests
+cargo test --release -- --ignored --nocapture   # stress test, about a minute
+```
+
+The stress test runs several million operations across the TOTP, throttle, PAM
 conversation and file paths and fails if peak memory or the number of open
-file descriptors grows. It takes about a minute.
+file descriptors grows.
 
-## Current scope
+`tests/e2e` holds an end-to-end test that drives real SSH logins through every
+path shown above. It reconfigures sshd and PAM, so run it only as root on a
+disposable machine with the module already built:
 
-This is an initial implementation. It does not create accounts or configure
-sudo authorization. The host clock must be synchronized. It uses `flock` on a
-persistent per-user lock file and requires the filesystem to honor POSIX
-advisory locks and atomic rename semantics.
+```sh
+sh tests/e2e/setup.sh && python3 tests/e2e/run.py
+```

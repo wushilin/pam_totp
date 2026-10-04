@@ -6,9 +6,6 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-
 jobs:
   build:
     strategy:
@@ -19,6 +16,10 @@ jobs:
           - runner: ubuntu-22.04-arm
             arch: aarch64
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - name: Install PAM headers
@@ -33,9 +34,30 @@ jobs:
           cp target/release/libpam_totp.so "dist/pam_totp-${{ matrix.arch }}-linux-gnu.so"
           cp target/release/otputil "dist/otputil-${{ matrix.arch }}-linux-gnu"
           cd dist && sha256sum * > "SHA256SUMS-${{ matrix.arch }}.txt"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/pam_totp-${{ matrix.arch }}-linux-gnu.so
+            dist/otputil-${{ matrix.arch }}-linux-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes || true
-          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes

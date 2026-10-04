@@ -18,4 +18,3 @@ sha1 = "0.10"
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
