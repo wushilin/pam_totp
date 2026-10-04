@@ -124,9 +124,11 @@ Things to know before turning it on:
   case-insensitive directory service are one enrollment.
 - The QR code and key stay in the terminal's scrollback and in any session
   recording. Clear the screen after enrolling.
-- The QR code needs a UTF-8 terminal. It is drawn for dark-background
-  terminals; set `qr_dark_terminal=false` if your users have light ones. The
-  text key always works.
+- The QR code needs a UTF-8 terminal. It is drawn with its own border, so it
+  scans on dark and light backgrounds alike with current authenticator apps.
+  On a light background the colours are reversed, which a few older scanners
+  reject; `qr_dark_terminal=false` draws it the other way round for those.
+  The text key always works.
 - To make a user enroll again, delete their `KEY` file.
 
 ## What each path looks like
@@ -197,7 +199,7 @@ time; a mistake in PAM or sshd configuration can lock you out.
 | `otp_exempted_group=NAME` | none | Members of this group skip the OTP step. |
 | `publickey_exempted=true\|false` | `false` | Skip the OTP step when sshd reports an earlier public-key step. |
 | `otp_enroll=true\|false` | `false` | Let a user without a `KEY` enroll at login. |
-| `qr_dark_terminal=true\|false` | `true` | Draw the enrollment QR code for dark-background terminals. |
+| `qr_dark_terminal=true\|false` | `true` | Polarity of the enrollment QR code. The default scans on either background with current apps; `false` is only for scanners that reject reversed colours on a light terminal. |
 | `pam_working_dir=/abs/path` | `/etc/pam_totp` | Where keys and state are stored. |
 
 An unknown option or a bad value makes the module fail every login, so check
