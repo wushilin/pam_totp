@@ -1,0 +1,41 @@
+name: release
+
+# Pushing a tag such as v0.1.0 builds the module and attaches it to a GitHub
+# Release. The .so is a release asset; it is never committed to the repository.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PAM headers
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/libpam_totp.so "dist/pam_totp-${{ matrix.arch }}-linux-gnu.so"
+          cp target/release/otputil "dist/otputil-${{ matrix.arch }}-linux-gnu"
+          cd dist && sha256sum * > "SHA256SUMS-${{ matrix.arch }}.txt"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber

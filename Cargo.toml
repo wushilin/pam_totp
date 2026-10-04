@@ -1,0 +1,21 @@
+[package]
+name = "pam-totp-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A small Linux PAM module for password-following TOTP authentication"
+
+[lib]
+name = "pam_totp"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hmac = "0.12"
+libc = "0.2"
+qrcodegen = { path = "vendor/qrcodegen-1.8.0" }
+sha1 = "0.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
