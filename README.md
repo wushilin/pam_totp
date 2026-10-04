@@ -115,8 +115,10 @@ sudo install -d -o root -g root -m 0700 /etc/pam_totp
 sudo install -d -o root -g root -m 0700 /etc/pam_totp/jack
 ```
 
-Every user who must pass OTP needs a directory named after their login, even
-when `otp_enroll=true` is used. A user without one is rejected.
+The working directory is never created by the module. The per-user directory
+is created automatically only when `otp_enroll=true` and the login name is an
+existing account; otherwise a user without a directory is rejected, so create
+one for each user you give a key to by hand.
 
 ### 3. Give the user a key
 

@@ -274,7 +274,11 @@ fn check_root_owned_dir(path: &Path, allow_group_write: bool) -> Result<(), ()> 
     Ok(())
 }
 
-fn safe_user_dir(base: &Path, user: &str) -> Result<PathBuf, ()> {
+fn account_exists(user: &str) -> bool {
+    CString::new(user).is_ok_and(|u| lookup_primary_gid(&u).is_some())
+}
+
+fn safe_user_dir(base: &Path, user: &str, create: bool) -> Result<PathBuf, ()> {
     if user.is_empty()
         || user == "."
         || user == ".."
@@ -286,6 +290,15 @@ fn safe_user_dir(base: &Path, user: &str) -> Result<PathBuf, ()> {
     }
     check_root_owned_dir(base, false)?;
     let dir = base.join(user);
+    if create {
+        match std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+            .create(&dir)
+        {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(()),
+        }
+    }
     check_root_owned_dir(&dir, false)?;
     Ok(dir)
 }
@@ -823,7 +836,10 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 return Ok(PAM_SUCCESS);
             }
         }
-        let dir = safe_user_dir(&base, user).map_err(|_| PAM_AUTH_ERR)?;
+        // Self-enrollment creates the user directory, but only for real
+        // accounts so mistyped or made-up names cannot litter the store.
+        let create = enroll_missing && account_exists(user);
+        let dir = safe_user_dir(&base, user, create).map_err(|_| PAM_AUTH_ERR)?;
         verify_or_enroll(pamh, user, &base, &dir, enroll_missing).map_err(|_| PAM_AUTH_ERR)?;
         Ok(PAM_SUCCESS)
     });
@@ -1042,11 +1058,13 @@ mod tests {
         let base = std::env::temp_dir().join(format!("pam_totp_stress_{}", std::process::id()));
         let dir = base.join("alice");
         let _ = fs::remove_dir_all(&base);
-        for d in [&base, &dir] {
-            fs::create_dir(d).unwrap();
-            fs::set_permissions(d, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-        }
-        assert_eq!(safe_user_dir(&base, "alice").unwrap(), dir);
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        assert!(safe_user_dir(&base, "alice", false).is_err());
+        assert!(safe_user_dir(&base, "../alice", true).is_err());
+        assert_eq!(safe_user_dir(&base, "alice", true).unwrap(), dir);
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(safe_user_dir(&base, "alice", false).unwrap(), dir);
 
         steady("throttle file", 100_000, |i| {
             let key = throttle_key("alice", (i % 6000).to_string().as_bytes());
