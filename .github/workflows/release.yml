@@ -1,19 +1,23 @@
 name: release
 
-# Pushing a tag such as v0.1.0 builds the module and attaches it to a GitHub
-# Release. The .so is a release asset; it is never committed to the repository.
+# Pushing a tag such as v0.1.0 builds the module, checks that it loads on each
+# supported distribution and attaches it to a GitHub Release. Running the
+# workflow by hand does the build and the checks without publishing.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
+  # One binary per architecture serves every glibc distribution: it is built
+  # on AlmaLinux 8, so it needs nothing newer than glibc 2.28.
   build:
     strategy:
       matrix:
         include:
-          - runner: ubuntu-22.04
+          - runner: ubuntu-24.04
             arch: x86_64
-          - runner: ubuntu-22.04-arm
+          - runner: ubuntu-24.04-arm
             arch: aarch64
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -22,19 +26,25 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v4
-      - name: Install PAM headers
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
-      - name: Test
-        run: cargo test --locked
-      - name: Build
-        run: cargo build --release --locked
+      - name: Test and build against glibc 2.28
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src almalinux:8 sh -euc '
+            dnf -y -q install gcc pam-devel
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            . "$HOME/.cargo/env"
+            cargo test --locked
+            cargo build --release --locked
+          '
       - name: Package
         run: |
           mkdir dist
           cp target/release/libpam_totp.so "dist/pam_totp-${{ matrix.arch }}-linux-gnu.so"
           cp target/release/otputil "dist/otputil-${{ matrix.arch }}-linux-gnu"
-          cd dist && sha256sum * > "SHA256SUMS-${{ matrix.arch }}.txt"
+          (cd dist && sha256sum * > "SHA256SUMS-${{ matrix.arch }}.txt")
+          echo "Newest glibc symbol version required:"
+          objdump -T dist/*.so | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
       - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
@@ -46,9 +56,54 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  release:
+  verify:
     needs: build
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        image:
+          - redhat/ubi8
+          - redhat/ubi9
+          - redhat/ubi10
+          - almalinux:8
+          - almalinux:9
+          - almalinux:10
+          - quay.io/centos/centos:stream9
+          - quay.io/centos/centos:stream10
+          - oraclelinux:9
+          - amazonlinux:2023
+          - fedora:latest
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - ubuntu:26.04
+          - debian:12
+          - debian:13
+          - opensuse/leap:15.6
+          - opensuse/tumbleweed
+          - archlinux:latest
+        exclude:
+          # Arch Linux publishes no official aarch64 image.
+          - arch: aarch64
+            image: archlinux:latest
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist
+      - name: Load the module on ${{ matrix.image }}
+        run: |
+          chmod +x dist/otputil-*
+          docker run --rm -v "$PWD:/w" -w /w "${{ matrix.image }}" sh .github/smoke.sh "${{ matrix.arch }}"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, verify]
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
