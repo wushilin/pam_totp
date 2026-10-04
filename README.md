@@ -394,15 +394,36 @@ Building needs the PAM development files (`libpam0g-dev` on Debian/Ubuntu,
 ## Releases
 
 Pushing a tag that starts with `v` runs `.github/workflows/release.yml`, which
-tests and builds the module on Ubuntu 22.04 for x86_64 and aarch64 and attaches
-`pam_totp-<arch>-linux-gnu.so`, `otputil-<arch>-linux-gnu` and checksums to a
-GitHub Release:
+attaches `pam_totp-<arch>-linux-gnu.so`, `otputil-<arch>-linux-gnu` and
+checksums for x86_64 (amd64) and aarch64 (arm64) to a GitHub Release:
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-The binaries need glibc 2.35 or newer. Build from source on older systems.
+There is one binary per architecture, not one per distribution. It is built on
+AlmaLinux 8, so it needs only glibc 2.28 and runs on anything newer. Before
+publishing, the workflow loads the module inside a container of each of these
+and stops the release if any fails:
+
+| Family | Versions checked |
+|---|---|
+| RHEL (UBI) | 8, 9, 10 |
+| AlmaLinux | 8, 9, 10 |
+| CentOS Stream | 9, 10 |
+| Oracle Linux | 9 |
+| Amazon Linux | 2023 |
+| Fedora | latest |
+| Ubuntu | 22.04, 24.04, 26.04 |
+| Debian | 12, 13 |
+| openSUSE | Leap 15.6, Tumbleweed |
+| Arch Linux | latest (x86_64 only) |
+
+That check covers loading against the distribution's libc and libpam. It does
+not run a login; use `tests/e2e` for that. Alpine and other musl systems are
+not supported by these binaries. Running the workflow by hand from the Actions
+tab does the build and the checks without publishing.
+
 Each binary carries a build provenance attestation:
 
 ```sh
